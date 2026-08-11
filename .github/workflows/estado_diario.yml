@@ -1,0 +1,40 @@
+name: Estado Diario TDLC
+
+# Cuándo se ejecuta este robot
+on:
+  schedule:
+    # Se ejecuta todos los días de lunes a viernes a las 13:00 UTC
+    # (09:00 hora de Chile en horario de verano / 10:00 en horario de invierno)
+    # Puedes ajustar este horario. Usa https://crontab.guru para calcularlo.
+    - cron: "0 13 * * 1-5"
+  # Esto permite ejecutarlo manualmente desde la pestaña "Actions" de GitHub
+  workflow_dispatch:
+
+# Permiso necesario para que el robot pueda guardar el "hash" en el repositorio
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar librerías de Python
+        run: pip install -r requirements.txt
+
+      - name: Instalar navegador para Playwright
+        run: playwright install --with-deps chromium
+
+      - name: Ejecutar el bot
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+        run: python estado_diario_tdlc.py
