@@ -302,7 +302,15 @@ def fetch_tdlc():
 
             # Reabrir modal para obtener el span de esta causa
             goto_con_reintentos(page, f"{URL_BASE}/estadoDiario")
+            try:
+                page.wait_for_selector(".glyphicon-new-window", timeout=15000)
+            except PlaywrightTimeoutError:
+                print(f"  ⚠️ No cargó el ícono para {causa['rol']}, se omite")
+                continue
             iconos = page.query_selector_all(".glyphicon-new-window")
+            if not iconos:
+                print(f"  ⚠️ Sin íconos para {causa['rol']}, se omite")
+                continue
             iconos[0].click()
             page.wait_for_timeout(4000)
 
