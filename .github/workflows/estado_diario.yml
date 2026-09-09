@@ -29,6 +29,14 @@ jobs:
       - name: Instalar librerías de Python
         run: pip install -r requirements.txt
 
+      - name: Quitar repo roto de Google Chrome
+        # El runner de GitHub trae preconfigurado el repo apt de dl.google.com/linux/chrome-stable
+        # para casos de Chrome for Testing. Playwright no lo necesita (descarga Chromium por su
+        # cuenta), pero "playwright install --with-deps" corre "apt-get update" antes de instalar,
+        # y si ese repo tiene un índice corrupto del lado de Google, tumba el paso completo con
+        # "Hash Sum mismatch" aunque no tenga nada que ver con lo que realmente se está instalando.
+        run: sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+
       - name: Instalar navegador para Playwright
         run: playwright install --with-deps chromium
 
