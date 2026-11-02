@@ -6,11 +6,17 @@ import requests
 import datetime as dt
 import pdfplumber
 import subprocess
+import sys
+import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-HASH_FILE      = "last_hash.txt"
 PAGE_HASH_FILE = "last_page_hash.txt"
+NOTIF_FILE     = "notificadas.json"
 URL_BASE       = "https://consultas.tdlc.cl"
+
+# Reintento de causas que quedaron incompletas (ícono que no cargó, PDF que no bajó, etc.)
+RONDAS_CAUSAS  = 3
+PAUSA_RONDA_S  = 60
 
 # ── Fecha de hoy en Chile (UTC-4) ─────────────────────────────────────────────
 hoy_chile = dt.datetime.now() - dt.timedelta(hours=4)
@@ -53,7 +59,7 @@ def reload_con_reintentos(page, intentos=3, espera_extra=5000, **kwargs):
             page.wait_for_timeout(3000)
 
 
-def esperar_icono_con_reintentos(page, url_recarga, intentos=3, timeout=15000):
+def esperar_icono_con_reintentos(page, url_recarga, intentos=3, timeout=30000):
     """
     Espera el ícono '.glyphicon-new-window' con reintentos.
     Si no aparece, vuelve a navegar a url_recarga (con su propio
@@ -83,18 +89,48 @@ def save_page_hash(h):
     with open(PAGE_HASH_FILE, "w") as f:
         f.write(h)
 
-def push_page_hash():
+def push_estado(mensaje="update estado"):
+    """Sube al repo los archivos de estado (hash de página y resoluciones ya notificadas)."""
     try:
         subprocess.run(["git", "config", "user.name",  "tdlc-bot"],  check=True)
         subprocess.run(["git", "config", "user.email", "bot@tdlc"],  check=True)
-        subprocess.run(["git", "add", PAGE_HASH_FILE],               check=True)
+        archivos = [f for f in (PAGE_HASH_FILE, NOTIF_FILE) if os.path.exists(f)]
+        subprocess.run(["git", "add", *archivos],                    check=True)
         result = subprocess.run(["git", "diff", "--cached", "--quiet"])
         if result.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "update page hash"], check=True)
-            subprocess.run(["git", "push", "origin", "main"],           check=True)
-        print("✅ Hash de página guardado en repo")
+            subprocess.run(["git", "commit", "-m", mensaje],         check=True)
+            subprocess.run(["git", "push", "origin", "main"],        check=True)
+        print("✅ Estado guardado en repo")
+        return True
     except Exception as e:
-        print(f"⚠️  No se pudo guardar hash de página: {e}")
+        print(f"⚠️  No se pudo guardar el estado en el repo: {e}")
+        return False
+
+
+# ── Resoluciones ya notificadas (evita duplicados entre ejecuciones) ──────────
+def clave_resolucion(r):
+    return "|".join(str(r.get(k, "")) for k in ("rol", "cuaderno", "referencia", "fecha"))
+
+def load_notificadas():
+    """Claves de las resoluciones ya enviadas hoy. Se reinicia cada día."""
+    hoy = hoy_chile.strftime("%Y-%m-%d")
+    try:
+        with open(NOTIF_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("fecha") == hoy:
+            return set(data.get("claves", []))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return set()
+
+def save_notificadas(claves):
+    with open(NOTIF_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"fecha": hoy_chile.strftime("%Y-%m-%d"), "claves": sorted(claves)},
+            f, ensure_ascii=False, indent=1,
+        )
+
+
 
 
 # ── Descarga PDF con cookies de Playwright ────────────────────────────────────
@@ -210,6 +246,8 @@ def procesar_tramites_cuaderno(page, cookies_dict, id_cuaderno, nombre_cuaderno)
     """
     Dado un idCuaderno, obtiene sus trámites y retorna las resoluciones
     de hoy con el texto del PDF extraído.
+    Retorna (resoluciones, completo); completo=False si no se pudo leer el
+    cuaderno o bajar algún PDF.
     """
     resp_raw = page.evaluate(f"""() => {{
         var xhr = new XMLHttpRequest();
@@ -226,7 +264,7 @@ def procesar_tramites_cuaderno(page, cookies_dict, id_cuaderno, nombre_cuaderno)
         tramites = data.get("results", data) if isinstance(data, dict) else data
     except Exception:
         print(f"    ❌ Error JSON en cuaderno '{nombre_cuaderno}'")
-        return []
+        return [], False
 
     resoluciones_hoy = [
         t for t in tramites
@@ -237,6 +275,7 @@ def procesar_tramites_cuaderno(page, cookies_dict, id_cuaderno, nombre_cuaderno)
     print(f"    Resoluciones de hoy en '{nombre_cuaderno}': {len(resoluciones_hoy)}")
 
     encontradas = []
+    completo    = True
     for tramite in resoluciones_hoy:
         id_enc     = tramite.get("idDocumentoEncriptado")
         referencia = tramite.get("referencia", "sin referencia")
@@ -263,15 +302,179 @@ def procesar_tramites_cuaderno(page, cookies_dict, id_cuaderno, nombre_cuaderno)
                 break
         else:
             print(f"    ⚠️  No se pudo descargar PDF de '{referencia}'")
+            completo = False
 
-    return encontradas
+    return encontradas, completo
 
 
 # ── Scraping principal ────────────────────────────────────────────────────────
-def fetch_tdlc():
-    resultados  = []
-    causas_hash = None
+def procesar_causa(page, context, i, causa):
+    """
+    Entra a la causa i del estado diario y recolecta las resoluciones de hoy
+    (cuaderno principal y adicionales).
 
+    Retorna (resultados, completa). completa=False si algo no se pudo leer
+    (ícono que no cargó, causa sin idCuaderno, cuaderno sin id, PDF que no
+    bajó), para que el llamador reintente en vez de dar la causa por revisada.
+    """
+    resultados = []
+
+    # Reabrir modal para obtener el span de esta causa
+    goto_con_reintentos(page, f"{URL_BASE}/estadoDiario")
+    icono = esperar_icono_con_reintentos(page, f"{URL_BASE}/estadoDiario")
+    if not icono:
+        print(f"  ⚠️ No cargó el ícono para {causa['rol']} tras varios reintentos")
+        return resultados, False
+    iconos = page.query_selector_all(".glyphicon-new-window")
+    if not iconos:
+        print(f"  ⚠️ Sin íconos para {causa['rol']}")
+        return resultados, False
+    iconos[0].click()
+    page.wait_for_timeout(4000)
+
+    spans_causa = page.query_selector_all(
+        "#showDetalle tbody tr td span.glyphicon-new-window"
+    )
+    if i >= len(spans_causa):
+        print(f"  ⚠️ El modal no mostró la fila {i+1} ({causa['rol']})")
+        return resultados, False
+
+    # Abrir página de la causa en nueva pestaña
+    with context.expect_page() as nueva_page_info:
+        spans_causa[i].click()
+    nueva_page = nueva_page_info.value
+    completa   = True
+    try:
+        try:
+            nueva_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except PlaywrightTimeoutError:
+            print("  ⚠️ Timeout esperando carga de nueva página, continuando de todos modos")
+        nueva_page.wait_for_timeout(8000)
+
+        url_causa = nueva_page.url
+        id_causa  = (
+            url_causa.split("idCausa=")[-1].split("&")[0]
+            if "idCausa=" in url_causa else None
+        )
+        print(f"  idCausa: {id_causa}")
+
+        # ── Capturar idCuaderno principal escuchando requests ─────────────
+        id_cuaderno_principal = None
+        requests_capturados   = []
+
+        def capturar_request(request):
+            if "bloqueadossummary" in request.url:
+                requests_capturados.append(request.url)
+
+        nueva_page.on("request", capturar_request)
+        reload_con_reintentos(nueva_page, espera_extra=10000)
+
+        for url_req in requests_capturados:
+            partes = url_req.split("/")
+            if "bloqueadossummary" in partes:
+                idx                   = partes.index("bloqueadossummary")
+                id_cuaderno_principal = partes[idx + 1]
+                break
+
+        nueva_page.remove_listener("request", capturar_request)
+        print(f"  idCuaderno principal: {id_cuaderno_principal}")
+
+        if not id_cuaderno_principal:
+            print(f"  ⚠️ No se obtuvo idCuaderno principal de {causa['rol']}")
+            return resultados, False
+
+        cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
+
+        # ── Cuaderno principal ────────────────────────────────────────────
+        encontradas, ok = procesar_tramites_cuaderno(
+            nueva_page, cookies_dict, id_cuaderno_principal, "Cuaderno principal"
+        )
+        completa = completa and ok
+        for r in encontradas:
+            resultados.append({**causa, **r})
+
+        # ── Cuadernos adicionales ─────────────────────────────────────────
+        cuadernos_dom   = obtener_nombres_cuadernos(nueva_page)
+        cuadernos_extra = [c for c in cuadernos_dom if c["index"] != 0]
+        print(f"  Cuadernos adicionales detectados: {len(cuadernos_extra)}")
+
+        for cuaderno in cuadernos_extra:
+            nombre_c = cuaderno["text"]
+            idx_c    = cuaderno["index"]
+            print(f"\n  📁 Procesando: '{nombre_c}' (índice={idx_c})")
+
+            id_c = seleccionar_cuaderno_y_capturar_id(nueva_page, idx_c, nombre_c)
+            print(f"    idCuaderno capturado: {id_c}")
+
+            if not id_c:
+                # Fallback: recargar la página del expediente y reintentar
+                print(f"    ⚠️  Reintentando tras recarga...")
+                goto_con_reintentos(
+                    nueva_page,
+                    f"{URL_BASE}/estadoDiario?idCausa={id_causa}",
+                    espera_extra=10000,
+                    timeout=30000,
+                )
+                cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
+                id_c = seleccionar_cuaderno_y_capturar_id(nueva_page, idx_c, nombre_c)
+                print(f"    idCuaderno reintento: {id_c}")
+
+            if id_c:
+                encontradas, ok = procesar_tramites_cuaderno(
+                    nueva_page, cookies_dict, id_c, nombre_c
+                )
+                completa = completa and ok
+                for r in encontradas:
+                    resultados.append({**causa, **r})
+            else:
+                print(f"    ❌ No se pudo obtener idCuaderno para '{nombre_c}'")
+                completa = False
+    finally:
+        nueva_page.close()
+
+    return resultados, completa
+
+
+def recolectar_con_rondas(causas, procesar, rondas=RONDAS_CAUSAS,
+                          pausa_s=PAUSA_RONDA_S, esperar=time.sleep):
+    """
+    Recorre las causas y reintenta las que quedaron incompletas, hasta `rondas`
+    pasadas. `procesar(i, causa)` retorna (resultados, completa); si lanza una
+    excepción, la causa se cuenta como incompleta.
+
+    Retorna (resultados sin duplicados, causas que siguen incompletas).
+    """
+    por_clave  = {}
+    pendientes = list(range(len(causas)))
+
+    for ronda in range(1, rondas + 1):
+        if not pendientes:
+            break
+        if ronda > 1:
+            print(f"\n🔁 Ronda {ronda}/{rondas}: {len(pendientes)} causa(s) incompleta(s), "
+                  f"reintento en {pausa_s} s")
+            esperar(pausa_s)
+
+        siguientes = []
+        for i in pendientes:
+            causa = causas[i]
+            print(f"\n📂 [{i+1}/{len(causas)}] {causa['rol']} — {causa['caratula']}")
+            try:
+                res, completa = procesar(i, causa)
+            except Exception as e:
+                print(f"  ❌ Error procesando {causa['rol']}: {e}")
+                res, completa = [], False
+            for r in res:
+                por_clave[clave_resolucion(r)] = r
+            if not completa:
+                siguientes.append(i)
+        pendientes = siguientes
+
+    return list(por_clave.values()), [causas[i] for i in pendientes]
+
+
+def fetch_tdlc():
+    """Retorna (resultados, causas_hash, causas_omitidas)."""
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context()
@@ -284,7 +487,7 @@ def fetch_tdlc():
         if not detalle_icon:
             print("Error abriendo modal: ícono no apareció tras varios reintentos")
             browser.close()
-            return [], None
+            return [], None, []
         detalle_icon.click()
         page.wait_for_timeout(4000)
         print("✅ Modal abierto")
@@ -301,6 +504,8 @@ def fetch_tdlc():
         print(f"✅ {len(causas)} causas en el estado diario de hoy")
 
         # ── Paso 2: calcular hash de la lista y comparar ──────────────────
+        # El hash se guarda recién al final (ver main), y solo si no quedó
+        # ninguna causa sin revisar.
         causas_hash = hashlib.md5(
             json.dumps(causas, ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
@@ -308,128 +513,22 @@ def fetch_tdlc():
         if causas_hash == load_page_hash():
             print("📄 Lista de causas sin cambios. Nada que hacer.")
             browser.close()
-            return [], causas_hash
+            return [], causas_hash, []
 
-        save_page_hash(causas_hash)
-        push_page_hash()
         print("🔄 Lista de causas cambió, entrando a cada causa...")
 
-        # ── Paso 3: scraping completo ─────────────────────────────────────
-        for i, causa in enumerate(causas):
-            print(f"\n📂 [{i+1}/{len(causas)}] {causa['rol']} — {causa['caratula']}")
-
-            # Reabrir modal para obtener el span de esta causa
-            goto_con_reintentos(page, f"{URL_BASE}/estadoDiario")
-            icono = esperar_icono_con_reintentos(page, f"{URL_BASE}/estadoDiario")
-            if not icono:
-                print(f"  ⚠️ No cargó el ícono para {causa['rol']} tras varios reintentos, se omite")
-                continue
-            iconos = page.query_selector_all(".glyphicon-new-window")
-            if not iconos:
-                print(f"  ⚠️ Sin íconos para {causa['rol']}, se omite")
-                continue
-            iconos[0].click()
-            page.wait_for_timeout(4000)
-
-            spans_causa = page.query_selector_all(
-                "#showDetalle tbody tr td span.glyphicon-new-window"
-            )
-            if i >= len(spans_causa):
-                continue
-
-            # Abrir página de la causa en nueva pestaña
-            with context.expect_page() as nueva_page_info:
-                spans_causa[i].click()
-            nueva_page = nueva_page_info.value
-            try:
-                nueva_page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except PlaywrightTimeoutError:
-                print("  ⚠️ Timeout esperando carga de nueva página, continuando de todos modos")
-            nueva_page.wait_for_timeout(8000)
-
-            url_causa = nueva_page.url
-            id_causa  = (
-                url_causa.split("idCausa=")[-1].split("&")[0]
-                if "idCausa=" in url_causa else None
-            )
-            print(f"  idCausa: {id_causa}")
-
-            # ── Capturar idCuaderno principal escuchando requests ─────────
-            id_cuaderno_principal = None
-            requests_capturados   = []
-
-            def capturar_request(request):
-                if "bloqueadossummary" in request.url:
-                    requests_capturados.append(request.url)
-
-            nueva_page.on("request", capturar_request)
-            reload_con_reintentos(nueva_page, espera_extra=10000)
-
-            for url_req in requests_capturados:
-                partes = url_req.split("/")
-                if "bloqueadossummary" in partes:
-                    idx                   = partes.index("bloqueadossummary")
-                    id_cuaderno_principal = partes[idx + 1]
-                    break
-
-            nueva_page.remove_listener("request", capturar_request)
-            print(f"  idCuaderno principal: {id_cuaderno_principal}")
-
-            if not id_cuaderno_principal:
-                nueva_page.close()
-                continue
-
-            cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
-
-            # ── Cuaderno principal ────────────────────────────────────────
-            for r in procesar_tramites_cuaderno(
-                nueva_page, cookies_dict, id_cuaderno_principal, "Cuaderno principal"
-            ):
-                resultados.append({**causa, **r})
-
-            # ── Cuadernos adicionales ─────────────────────────────────────
-            cuadernos_dom   = obtener_nombres_cuadernos(nueva_page)
-            cuadernos_extra = [c for c in cuadernos_dom if c["index"] != 0]
-            print(f"  Cuadernos adicionales detectados: {len(cuadernos_extra)}")
-
-            for cuaderno in cuadernos_extra:
-                nombre_c = cuaderno["text"]
-                idx_c    = cuaderno["index"]
-                print(f"\n  📁 Procesando: '{nombre_c}' (índice={idx_c})")
-
-                id_c = seleccionar_cuaderno_y_capturar_id(nueva_page, idx_c, nombre_c)
-                print(f"    idCuaderno capturado: {id_c}")
-
-                if not id_c:
-                    # Fallback: recargar la página del expediente y reintentar
-                    print(f"    ⚠️  Reintentando tras recarga...")
-                    goto_con_reintentos(
-                        nueva_page,
-                        f"{URL_BASE}/estadoDiario?idCausa={id_causa}",
-                        espera_extra=10000,
-                        timeout=30000,
-                    )
-                    cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
-                    id_c = seleccionar_cuaderno_y_capturar_id(nueva_page, idx_c, nombre_c)
-                    print(f"    idCuaderno reintento: {id_c}")
-
-                if id_c:
-                    for r in procesar_tramites_cuaderno(
-                        nueva_page, cookies_dict, id_c, nombre_c
-                    ):
-                        resultados.append({**causa, **r})
-                else:
-                    print(f"    ❌ No se pudo obtener idCuaderno para '{nombre_c}', se omite")
-
-            nueva_page.close()
-
+        # ── Paso 3: scraping completo, con reintento de causas incompletas ─
+        resultados, omitidas = recolectar_con_rondas(
+            causas, lambda i, causa: procesar_causa(page, context, i, causa)
+        )
         browser.close()
 
-    return resultados, causas_hash
+    return resultados, causas_hash, omitidas
+
 
 
 # ── Formatear mensaje (cuerpo del correo) ─────────────────────────────────────
-def formatear_mensaje(resultados):
+def formatear_mensaje(resultados, omitidas=None):
     hoy = hoy_chile.strftime("%d/%m/%Y")
     if not resultados:
         return f"📋 TDLC Estado Diario {hoy}\n\nNo se encontraron resoluciones nuevas hoy."
@@ -445,6 +544,13 @@ def formatear_mensaje(resultados):
         msg += f"🗂  {r.get('cuaderno', '')}\n"
         msg += f"⚖️  {r['referencia']}\n"
         msg += f"🕐 {r['fecha']}\n\n"
+
+    if omitidas:
+        msg += f"{'-'*50}\n"
+        msg += "⚠️ No se pudo revisar completas en esta ejecución:\n"
+        for c in omitidas:
+            msg += f"   • {c['rol']} — {c['caratula']}\n"
+        msg += "El bot reintenta en la próxima ejecución; revisar a mano si no llega aviso.\n\n"
 
     msg += f"🔗 {URL_BASE}/estadoDiario"
     return msg
@@ -518,44 +624,42 @@ def send_email(message, resultados):
     print(f"Email enviado a {len(destinatarios)} destinatario(s)")
 
 
-# ── Hash de resultados ────────────────────────────────────────────────────────
-def get_hash(resultados):
-    contenido = json.dumps(
-        [{k: v for k, v in r.items() if k != "contenido"} for r in resultados],
-        ensure_ascii=False, sort_keys=True,
-    )
-    return hashlib.md5(contenido.encode()).hexdigest()
-
-def load_last_hash():
-    if os.path.exists(HASH_FILE):
-        with open(HASH_FILE) as f:
-            return f.read().strip()
-    return ""
-
-def save_hash(h):
-    with open(HASH_FILE, "w") as f:
-        f.write(h)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main():
     print(f"Verificando TDLC — {hoy_chile.strftime('%d/%m/%Y %H:%M')}...")
 
     try:
-        resultados, causas_hash = fetch_tdlc()
+        resultados, causas_hash, omitidas = fetch_tdlc()
     except Exception as e:
         print(f"❌ Error fatal en fetch_tdlc: {e}")
         raise
 
-    if not resultados:
-        print("Sin resoluciones nuevas hoy.")
+    notificadas = load_notificadas()
+    nuevas      = [r for r in resultados if clave_resolucion(r) not in notificadas]
+    print(f"{len(resultados)} resolución(es) leídas, {len(nuevas)} sin notificar")
+
+    if nuevas:
+        print(f"¡{len(nuevas)} resolución(es) nueva(s)! Enviando notificación por correo...")
+        send_email(formatear_mensaje(nuevas, omitidas), nuevas)
+        notificadas.update(clave_resolucion(r) for r in nuevas)
+        save_notificadas(notificadas)
+        print("✅ Listo.")
     else:
-        current_hash = get_hash(resultados)
-        if current_hash == load_last_hash():
-            print("Sin cambios desde la última ejecución.")
-        else:
-            print(f"¡{len(resultados)} resolución(es) nueva(s)! Enviando notificación por correo...")
-            mensaje = formatear_mensaje(resultados)
-            send_email(mensaje, resultados)
-            save_hash(current_hash)
-            print("✅ Listo.")
+        print("Sin resoluciones nuevas hoy.")
+
+    if omitidas:
+        # No se guarda el hash de página: la próxima ejecución vuelve a entrar
+        # a estas causas. Las ya notificadas no se reenvían (NOTIF_FILE).
+        print("\n❌ Causas que no se pudieron revisar completas:")
+        for c in omitidas:
+            print(f"   - {c['rol']} — {c['caratula']}")
+        push_estado("update notificadas")
+        sys.exit(1)
+
+    if causas_hash:
+        save_page_hash(causas_hash)
+    push_estado("update estado")
+
+
+if __name__ == "__main__":
+    main()
