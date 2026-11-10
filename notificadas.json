@@ -1,12 +1,20 @@
 {
- "fecha": "2026-11-05",
+ "fecha": "2026-11-09",
  "claves": [
-  "C-518-2024|Cuaderno principal|Se resuelve|05/11/2026 07:00",
-  "C-527-2025|Cuaderno principal|No ha lugar|05/11/2026 07:00",
-  "C-535-2025|Cuaderno principal|Téngase presente|05/11/2026 07:00",
-  "C-540-2025|Cuaderno principal|Téngase como terceros|05/11/2026 07:00",
-  "C-546-2026|Cuaderno de incorporación del Expediente de Investigación de la FNE|Se resuelve|05/11/2026 07:00",
-  "C-567-2026|Cuaderno principal|No da curso a la medida prejudicial precautoria|05/11/2026 07:00",
-  "NC-559-2026|Cuaderno principal|Fija nueva fecha de audiencia publica e impone multa|05/11/2026 07:00"
+  "C-430-2021|Cuaderno principal|Por cumplido lo ordenado|09/11/2026 07:00",
+  "C-451-2022|Cuaderno principal|Vista de la causa|09/11/2026 07:00",
+  "C-510-2024|Cuaderno principal|Por cumplido lo ordenado|09/11/2026 07:00",
+  "C-511-2024|Cuaderno principal|Citación a audiencia|09/11/2026 07:00",
+  "C-517-2024|Cuaderno principal|Téngase presente|09/11/2026 07:00",
+  "C-518-2024|Cuaderno principal|Téngase presente|09/11/2026 07:00",
+  "C-521-2024|Cuaderno principal|Se decreta término probatorio extraordinario fuera del territorio nacional|09/11/2026 07:00",
+  "C-535-2025|Cuaderno principal|Se resuelve|09/11/2026 07:00",
+  "C-536-2025|Cuaderno principal|Ha lugar|09/11/2026 07:00",
+  "C-563-2026|Cuaderno principal|Póngase en conocimiento de las partes|09/11/2026 07:00",
+  "C-565-2026|Cuaderno principal|Da curso a la demanda|09/11/2026 07:00",
+  "CIP-26-2026|Cuaderno principal|No ha lugar|09/11/2026 07:00",
+  "NC-527-2023|Cuaderno principal|Téngase presente|09/11/2026 07:00",
+  "NC-542-2024|Cuaderno principal|Téngase presente|09/11/2026 07:00",
+  "NC-567-2026|Cuaderno principal|Téngase presente|09/11/2026 07:00"
  ]
 }
