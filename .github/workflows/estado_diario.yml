@@ -14,6 +14,11 @@ on:
 permissions:
   contents: write
 
+# Una sola ejecución a la vez; las demás esperan en cola
+concurrency:
+  group: estado-diario-tdlc
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
