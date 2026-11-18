@@ -25,7 +25,8 @@ jobs:
     steps:
       - name: Descargar el código del repositorio
         uses: actions/checkout@v4
-
+        with:
+          ref: main
       - name: Instalar Python
         uses: actions/setup-python@v5
         with:
